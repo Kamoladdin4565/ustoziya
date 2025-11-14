@@ -4,12 +4,16 @@ import pytesseract
 from PIL import Image
 import re
 import json
-from django.conf import settings
-from .models import OCRProcessing, TestResult
 import logging
+import os
+import io
+from django.conf import settings
 from google.cloud import vision
 from google.oauth2 import service_account
-import io
+from openpyxl import Workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
+from .models import OCRProcessing, TestResult
 
 logger = logging.getLogger(__name__)
 
@@ -257,49 +261,86 @@ class ExcelExportService:
     """Excel eksport xizmati"""
     
     def __init__(self):
-        import pandas as pd
-        self.pd = pd
+        self.header_font = Font(bold=True)
+    
+    def _auto_fit_columns(self, worksheet):
+        for column_cells in worksheet.columns:
+            max_length = 0
+            column = column_cells[0].column
+            for cell in column_cells:
+                try:
+                    cell_length = len(str(cell.value)) if cell.value is not None else 0
+                    max_length = max(max_length, cell_length)
+                except Exception:
+                    continue
+            adjusted_width = min(max_length + 2, 40)
+            worksheet.column_dimensions[get_column_letter(column)].width = adjusted_width
     
     def export_test_results(self, test, results):
         """Test natijalarini Excel ga eksport qilish"""
         try:
-            # Ma'lumotlarni tayyorlash
-            data = []
+            if not results:
+                logger.warning("Excel eksport qilish uchun natijalar topilmadi")
+                return None
+            
+            export_dir = os.path.join('media', 'excel_exports')
+            os.makedirs(export_dir, exist_ok=True)
+            timestamp = results[0].processed_at.strftime('%Y%m%d_%H%M%S')
+            excel_path = os.path.join(export_dir, f"test_{test.id}_{timestamp}.xlsx")
+            
+            workbook = Workbook()
+            results_sheet = workbook.active
+            results_sheet.title = 'Test natijalari'
+            
+            headers = [
+                "O'quvchi ismi",
+                "Sinf",
+                "Jami savollar",
+                "To'g'ri javoblar",
+                "Noto'g'ri javoblar",
+                "Ball",
+                "Foiz",
+                "Baholash",
+                "Qayta ishlangan vaqt"
+            ]
+            results_sheet.append(headers)
+            for cell in results_sheet[1]:
+                cell.font = self.header_font
+            
             for result in results:
-                data.append({
-                    'O\'quvchi ismi': result.student_name,
-                    'Sinf': result.student_class or '',
-                    'Jami savollar': result.total_questions,
-                    'To\'g\'ri javoblar': result.correct_answers,
-                    'Noto\'g\'ri javoblar': result.wrong_answers,
-                    'Ball': result.score,
-                    'Foiz': f"{result.percentage:.1f}%",
-                    'Baholash': result.grade,
-                    'Qayta ishlangan vaqt': result.processed_at.strftime('%Y-%m-%d %H:%M:%S')
-                })
+                results_sheet.append([
+                    result.student_name,
+                    result.student_class or '',
+                    result.total_questions,
+                    result.correct_answers,
+                    result.wrong_answers,
+                    result.score,
+                    f"{result.percentage:.1f}%",
+                    result.grade,
+                    result.processed_at.strftime('%Y-%m-%d %H:%M:%S')
+                ])
             
-            # DataFrame yaratish
-            df = self.pd.DataFrame(data)
+            self._auto_fit_columns(results_sheet)
             
-            # Excel fayl yaratish
-            excel_path = f"media/excel_exports/test_{test.id}_{results[0].processed_at.strftime('%Y%m%d_%H%M%S')}.xlsx"
+            summary_sheet = workbook.create_sheet("Umumiy ma'lumot")
+            summary_data = [
+                ("Test nomi", test.title),
+                ("Fan", test.get_subject_display()),
+                ("Sinf darajasi", test.grade_level),
+                ("Jami o'quvchilar", len(results)),
+                ("O'rtacha foiz", f"{sum(r.percentage for r in results) / len(results):.1f}%"),
+                ("Eksport vaqti", results[0].processed_at.strftime('%Y-%m-%d %H:%M:%S'))
+            ]
+            summary_sheet.append(["Ko'rsatkich", "Qiymat"])
+            for cell in summary_sheet[1]:
+                cell.font = self.header_font
             
-            with self.pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-                df.to_excel(writer, sheet_name='Test natijalari', index=False)
-                
-                # Qo'shimcha ma'lumotlar
-                summary_data = {
-                    'Test nomi': [test.title],
-                    'Fan': [test.get_subject_display()],
-                    'Sinf darajasi': [test.grade_level],
-                    'Jami o\'quvchilar': [len(results)],
-                    'O\'rtacha foiz': [f"{sum(r.percentage for r in results) / len(results):.1f}%"],
-                    'Eksport vaqti': [results[0].processed_at.strftime('%Y-%m-%d %H:%M:%S')]
-                }
-                
-                summary_df = self.pd.DataFrame(summary_data)
-                summary_df.to_excel(writer, sheet_name='Umumiy ma\'lumot', index=False)
+            for label, value in summary_data:
+                summary_sheet.append([label, value])
             
+            self._auto_fit_columns(summary_sheet)
+            
+            workbook.save(excel_path)
             return excel_path
             
         except Exception as e:
